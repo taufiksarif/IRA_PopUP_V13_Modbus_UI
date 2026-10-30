@@ -100,6 +100,9 @@ static constexpr size_t OUTPUT_COUNT = sizeof(OUTPUTS) / sizeof(OUTPUTS[0]);
 
 bool outputState[OUTPUT_COUNT] = {false, false, false, false, false, false, false};
 SemaphoreHandle_t stateMutex;
+SemaphoreHandle_t controlStateMutex;
+SemaphoreHandle_t timerMutex;
+portMUX_TYPE sequenceRequestMux = portMUX_INITIALIZER_UNLOCKED;
 // Sequence requests are consumed by the control task; 0=none, 1=Auto UP, 2=Auto DOWN, 3=Stop.
 volatile uint8_t sequenceRequest = 0;
 volatile bool sequenceRunning = false;
@@ -132,6 +135,87 @@ static const char *TIMER_LABELS[TIMER_COUNT] = {"Brake hold", "Enable delay", "D
                                                 "Speed 1 (first)", "Speed 2", "Speed 1 (return)", "Speed 0 (return)",
                                                 "Direction off delay", "Enable off delay", "Buzzer pulse interval", "Ready Signal delay", "Run Mode duration"};
 uint32_t sequenceTimersMs[TIMER_COUNT] = {2000, 2000, 2000, 3000, 3000, 5000, 3000, 3000, 2000, 2000, 2000, 30000, 3600000};
+
+uint32_t getSequenceTimerMs(size_t index) {
+  if (index >= TIMER_COUNT) return 0;
+  if (!timerMutex || xSemaphoreTake(timerMutex, portMAX_DELAY) != pdTRUE) return 0;
+  const uint32_t value = sequenceTimersMs[index];
+  xSemaphoreGive(timerMutex);
+  return value;
+}
+
+void setSequenceTimerMs(size_t index, uint32_t value) {
+  if (index >= TIMER_COUNT) return;
+  if (!timerMutex || xSemaphoreTake(timerMutex, portMAX_DELAY) != pdTRUE) return;
+  sequenceTimersMs[index] = value;
+  xSemaphoreGive(timerMutex);
+}
+
+void getSequenceSnapshot(String &status, uint32_t &stepStartedMs, uint32_t &stepDurationMs) {
+  status = "Unavailable";
+  stepStartedMs = millis();
+  stepDurationMs = 0;
+  if (controlStateMutex && xSemaphoreTake(controlStateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    status = sequenceStatus;
+    stepStartedMs = sequenceStepStartedMs;
+    stepDurationMs = sequenceStepDurationMs;
+    xSemaphoreGive(controlStateMutex);
+  }
+}
+
+void setSequenceStatus(const String &status) {
+  if (controlStateMutex && xSemaphoreTake(controlStateMutex, portMAX_DELAY) == pdTRUE) {
+    sequenceStatus = status;
+    xSemaphoreGive(controlStateMutex);
+  }
+}
+
+bool queueSequenceRequest(uint8_t request, bool allowReplaceStop = false) {
+  bool accepted = false;
+  portENTER_CRITICAL(&sequenceRequestMux);
+  if (request == 3) {
+    sequenceRequest = 3;
+    accepted = true;
+  } else if ((!sequenceRunning && sequenceRequest == 0) || (allowReplaceStop && sequenceRequest == 3)) {
+    sequenceRequest = request;
+    accepted = true;
+  }
+  portEXIT_CRITICAL(&sequenceRequestMux);
+  return accepted;
+}
+
+uint8_t takeSequenceRequest() {
+  portENTER_CRITICAL(&sequenceRequestMux);
+  const uint8_t request = sequenceRequest;
+  sequenceRequest = 0;
+  if (request == 1 || request == 2 || request == 4) sequenceRunning = true;
+  portEXIT_CRITICAL(&sequenceRequestMux);
+  return request;
+}
+
+void setSequenceRunning(bool running) {
+  portENTER_CRITICAL(&sequenceRequestMux);
+  sequenceRunning = running;
+  portEXIT_CRITICAL(&sequenceRequestMux);
+}
+
+void updateSequenceStep(uint32_t started, uint32_t duration, const String &status) {
+  if (controlStateMutex && xSemaphoreTake(controlStateMutex, portMAX_DELAY) == pdTRUE) {
+    sequenceStepStartedMs = started;
+    sequenceStepDurationMs = duration;
+    sequenceStepRemainingMs = duration;
+    sequenceStatus = status;
+    xSemaphoreGive(controlStateMutex);
+  }
+}
+
+void clearSequenceStep() {
+  if (controlStateMutex && xSemaphoreTake(controlStateMutex, portMAX_DELAY) == pdTRUE) {
+    sequenceStepDurationMs = 0;
+    sequenceStepRemainingMs = 0;
+    xSemaphoreGive(controlStateMutex);
+  }
+}
 String staSSID;
 String staPassword;
 volatile uint32_t canRxCount = 0;
@@ -190,16 +274,23 @@ int outputIndexForName(const String &name) {
   return -1;
 }
 
+bool applyOutputChanges(uint32_t mask, uint32_t values) {
+  if (!stateMutex || xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) != pdTRUE) return false;
+  for (size_t i = 0; i < OUTPUT_COUNT; ++i) {
+    if (mask & (1UL << i)) outputState[i] = (values & (1UL << i)) != 0;
+  }
+  xSemaphoreGive(stateMutex);
+  return true;
+}
+
 void setOutputState(size_t index, bool state) {
   if (index >= OUTPUT_COUNT) return;
-  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-    outputState[index] = state;
-    xSemaphoreGive(stateMutex);
-  }
+  const uint32_t bit = 1UL << index;
+  applyOutputChanges(bit, state ? bit : 0);
 }
 
 void copyOutputStates(bool *dst) {
-  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+  if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     for (size_t i = 0; i < OUTPUT_COUNT; ++i) dst[i] = outputState[i];
     xSemaphoreGive(stateMutex);
   }
@@ -207,13 +298,18 @@ void copyOutputStates(bool *dst) {
 
 String jsonEscape(const String &in) {
   String out;
-  out.reserve(in.length() + 8);
+  out.reserve(in.length() + 16);
+  static const char HEX_DIGITS[] = "0123456789ABCDEF";
   for (size_t i = 0; i < in.length(); ++i) {
-    char c = in[i];
+    const uint8_t c = (uint8_t)in[i];
     if (c == '"' || c == '\\') { out += '\\'; out += c; }
     else if (c == '\n') out += "\\n";
     else if (c == '\r') out += "\\r";
-    else if ((uint8_t)c >= 0x20) out += c;
+    else if (c == '\t') out += "\\t";
+    else if (c == '\b') out += "\\b";
+    else if (c == '\f') out += "\\f";
+    else if (c < 0x20) { out += "\\u00"; out += HEX_DIGITS[c >> 4]; out += HEX_DIGITS[c & 0x0F]; }
+    else out += (char)c;
   }
   return out;
 }
@@ -221,6 +317,9 @@ String jsonEscape(const String &in) {
 String makeStatusJson(bool includeDiagnostics = true) {
   bool states[OUTPUT_COUNT];
   copyOutputStates(states);
+  String sequenceStatusCopy;
+  uint32_t sequenceStartedCopy, sequenceDurationCopy;
+  getSequenceSnapshot(sequenceStatusCopy, sequenceStartedCopy, sequenceDurationCopy);
   String json = "{\"apSsid\":\"" + jsonEscape(apSSID) + "\",\"apIp\":\"" + WiFi.softAPIP().toString();
   json += "\",\"staConnected\":";
   json += (WiFi.status() == WL_CONNECTED) ? "true" : "false";
@@ -247,14 +346,14 @@ String makeStatusJson(bool includeDiagnostics = true) {
   json += ",\"readyRelayOn\":" + String(readyRelayOn ? "true" : "false");
   json += ",\"buzzerAfterRunMode\":" + String(buzzerAfterRunMode ? "true" : "false");
   json += ",\"buzzerRelayOn\":" + String(buzzerRelayOn ? "true" : "false");
-  const uint32_t elapsed = millis() - sequenceStepStartedMs;
-  const uint32_t remaining = sequenceStepDurationMs > elapsed ? sequenceStepDurationMs - elapsed : 0;
-  json += ",\"sequenceStepDurationMs\":" + String(sequenceStepDurationMs);
+  const uint32_t elapsed = millis() - sequenceStartedCopy;
+  const uint32_t remaining = sequenceDurationCopy > elapsed ? sequenceDurationCopy - elapsed : 0;
+  json += ",\"sequenceStepDurationMs\":" + String(sequenceDurationCopy);
   json += ",\"sequenceStepElapsedMs\":" + String(elapsed);
   json += ",\"sequenceStepRemainingMs\":" + String(sequenceRunning ? remaining : 0);
   const char *safetyState = (!canDriverReady || canBusState == 2) ? "FAULT" : (sequenceRunning ? "RUNNING" : "READY");
   json += ",\"safetyState\":\"" + String(safetyState) + "\"";
-    json += ",\"sequenceStatus\":\"" + jsonEscape(sequenceStatus) + "\"";
+    json += ",\"sequenceStatus\":\"" + jsonEscape(sequenceStatusCopy) + "\"";
   json += ",\"apActive\":" + String(WiFi.softAPIP()[0] != 0 ? "true" : "false");
   if (includeDiagnostics) {
   json += ",\"controlHeartbeatAgeMs\":" + String(millis() - controlHeartbeatMs);
@@ -320,14 +419,18 @@ bool modbusReadRegister(uint16_t address, uint16_t &value) {
     return true;
   }
   if (address == 3) {
-    const uint32_t elapsed = millis() - sequenceStepStartedMs;
-    const uint32_t remaining = sequenceStepDurationMs > elapsed ? sequenceStepDurationMs - elapsed : 0;
+    String sequenceStatusCopy;
+    uint32_t sequenceStartedCopy, sequenceDurationCopy;
+    getSequenceSnapshot(sequenceStatusCopy, sequenceStartedCopy, sequenceDurationCopy);
+    const uint32_t elapsed = millis() - sequenceStartedCopy;
+    const uint32_t remaining = sequenceDurationCopy > elapsed ? sequenceDurationCopy - elapsed : 0;
     value = (uint16_t)((remaining + 999UL) / 1000UL);
     return true;
   }
   if (address >= MODBUS_TIMER_BASE && address < MODBUS_TIMER_BASE + TIMER_COUNT) {
     const size_t index = address - MODBUS_TIMER_BASE;
-    value = (uint16_t)(index == T_RUN_MODE ? sequenceTimersMs[index] / 3600000UL : sequenceTimersMs[index] / 1000UL);
+    const uint32_t timer = getSequenceTimerMs(index);
+    value = (uint16_t)(index == T_RUN_MODE ? timer / 3600000UL : timer / 1000UL);
     return true;
   }
   return false;
@@ -335,12 +438,11 @@ bool modbusReadRegister(uint16_t address, uint16_t &value) {
 
 bool modbusSetCommand(uint16_t command) {
   if (command == 0) {
-    sequenceRequest = 3;
+    queueSequenceRequest(3);
     modbusLastCommand = command;
     return true;
   }
-  if (command > 3 || sequenceRunning || sequenceRequest == 1 || sequenceRequest == 2 || sequenceRequest == 4 || sequenceRequest == 3) return false;
-  sequenceRequest = command == 1 ? 1 : (command == 2 ? 2 : 4);
+  if (command > 3 || !queueSequenceRequest(command == 1 ? 1 : (command == 2 ? 2 : 4))) return false;
   modbusLastCommand = command;
   return true;
 }
@@ -350,7 +452,8 @@ bool modbusSetTimer(uint16_t address, uint16_t value) {
   const size_t index = address - MODBUS_TIMER_BASE;
   const uint16_t maxValue = index == T_READY_DELAY ? 600 : (index == T_RUN_MODE ? 24 : 30);
   if (value < 1 || value > maxValue) return false;
-  sequenceTimersMs[index] = index == T_RUN_MODE ? (uint32_t)value * 3600000UL : (uint32_t)value * 1000UL;
+  const uint32_t timerMs = index == T_RUN_MODE ? (uint32_t)value * 3600000UL : (uint32_t)value * 1000UL;
+  setSequenceTimerMs(index, timerMs);
   prefs.begin("seq-timers", false);
   prefs.putUInt(TIMER_KEYS[index], value);
   prefs.end();
@@ -728,17 +831,20 @@ void handleOutput() {
     server.send(409, "application/json; charset=utf-8", "{\"error\":\"Direction and speed controls are locked during an automatic sequence\"}");
     return;
   }
-  // Direction and speed controls behave like selector switches: selecting one
-  // automatically turns off its mutually exclusive peer(s).
+  // Update selector groups under one lock so observers never see conflicting states.
+  uint32_t mask = 1UL << index;
+  uint32_t values = requested ? mask : 0;
   if (requested && (index == 2 || index == 3)) {
-    setOutputState((size_t)(index == 2 ? 3 : 2), false);
+    mask |= (1UL << 2) | (1UL << 3);
+    values = 1UL << index;
+  } else if (requested && index >= 4 && index <= 6) {
+    mask |= (1UL << 4) | (1UL << 5) | (1UL << 6);
+    values = 1UL << index;
   }
-  if (requested && index >= 4 && index <= 6) {
-    for (int i = 4; i <= 6; ++i) {
-      if (i != index) setOutputState((size_t)i, false);
-    }
+  if (!applyOutputChanges(mask, values)) {
+    server.send(503, "application/json; charset=utf-8", "{\"error\":\"Output state is busy; try again\"}");
+    return;
   }
-  setOutputState((size_t)index, requested);
   server.send(200, "application/json; charset=utf-8", "{\"ok\":true}");
 }
 
@@ -750,7 +856,7 @@ void handleSequence() {
   String cmd = server.arg("cmd");
   cmd.toLowerCase();
   if (cmd == "stop") {
-    sequenceRequest = 3;
+    queueSequenceRequest(3);
     server.send(200, "application/json; charset=utf-8", "{\"ok\":true,\"message\":\"Sequence stopping\"}");
     return;
   }
@@ -758,19 +864,22 @@ void handleSequence() {
     server.send(400, "application/json; charset=utf-8", "{\"error\":\"unknown sequence\"}");
     return;
   }
-  if (sequenceRunning || sequenceRequest == 1 || sequenceRequest == 2 || sequenceRequest == 4) {
+  if (!queueSequenceRequest((cmd == "up") ? 1 : (cmd == "down" ? 2 : 4))) {
     server.send(409, "application/json; charset=utf-8", "{\"error\":\"A sequence is already running\"}");
     return;
   }
-  sequenceRequest = (cmd == "up") ? 1 : (cmd == "down" ? 2 : 4);
   server.send(200, "application/json; charset=utf-8", "{\"ok\":true,\"message\":\"Sequence accepted\"}");
 }
 
 void sendTimerJson() {
+  uint32_t timerSnapshot[TIMER_COUNT];
+  if (!timerMutex || xSemaphoreTake(timerMutex, pdMS_TO_TICKS(50)) != pdTRUE) { server.send(503, "application/json", "{\"error\":\"Timer settings busy\"}"); return; }
+  memcpy(timerSnapshot, sequenceTimersMs, sizeof(timerSnapshot));
+  xSemaphoreGive(timerMutex);
   String json = "{";
   for (size_t i = 0; i < TIMER_COUNT; ++i) {
     if (i) json += ',';
-    json += "\"" + String(TIMER_KEYS[i]) + "\":" + String(i == T_RUN_MODE ? sequenceTimersMs[i] / 3600000UL : sequenceTimersMs[i] / 1000UL);
+    json += "\"" + String(TIMER_KEYS[i]) + "\":" + String(i == T_RUN_MODE ? timerSnapshot[i] / 3600000UL : timerSnapshot[i] / 1000UL);
   }
   json += "}";
   server.send(200, "application/json; charset=utf-8", json);
@@ -793,9 +902,11 @@ void handleTimersSave() {
     }
     parsed[i] = (i == T_RUN_MODE) ? ((uint32_t)value * 3600000UL) : ((uint32_t)value * 1000UL);
   }
+  if (!timerMutex || xSemaphoreTake(timerMutex, pdMS_TO_TICKS(50)) != pdTRUE) { server.send(503, "application/json; charset=utf-8", "{\"error\":\"Timer settings busy\"}"); return; }
+  for (size_t i = 0; i < TIMER_COUNT; ++i) sequenceTimersMs[i] = parsed[i];
+  xSemaphoreGive(timerMutex);
   prefs.begin("seq-timers", false);
   for (size_t i = 0; i < TIMER_COUNT; ++i) {
-    sequenceTimersMs[i] = parsed[i];
     prefs.putUInt(TIMER_KEYS[i], i == T_RUN_MODE ? parsed[i] / 3600000UL : parsed[i] / 1000UL);
   }
   prefs.end();
@@ -1029,19 +1140,16 @@ void controlTask(void *parameter) {
   bool buttonLastReading = HIGH;
   bool buttonStableState = HIGH;
   uint32_t buttonLastChangeMs = 0;
-  auto allSpeedsOff = []() { setOutputState(4, false); setOutputState(5, false); setOutputState(6, false); };
-  auto setOnlySpeed = [](int index) {
-    setOutputState(4, index == 4); setOutputState(5, index == 5); setOutputState(6, index == 6);
-  };
+  auto allSpeedsOff = []() { applyOutputChanges((1UL << 4) | (1UL << 5) | (1UL << 6), 0); };
+  auto setOnlySpeed = [](int index) { applyOutputChanges((1UL << 4) | (1UL << 5) | (1UL << 6), 1UL << index); };
   auto beginStage = [&](Stage next, uint32_t durationMs, const char *label) {
-    stage = next; sequenceStepStartedMs = millis(); sequenceStepDurationMs = durationMs; sequenceStepRemainingMs = durationMs; deadline = sequenceStepStartedMs + durationMs; sequenceStatus = label;
+    stage = next; const uint32_t started = millis(); deadline = started + durationMs; updateSequenceStep(started, durationMs, label);
   };
   auto beginCycle = [&](int direction) {
     directionIndex = direction;
-    setOutputState(2, false); setOutputState(3, false); allSpeedsOff();
-    setOutputState(0, true);
-    beginStage(BRAKE_WAIT, sequenceTimersMs[T_BRAKE], directionIndex == 2 ? "Auto UP: Brake hold" : "Auto DOWN: Brake hold");
-    sequenceRunning = true;
+    applyOutputChanges(0x7D, 1UL << 0); // clear directions/speeds and engage brake atomically
+    beginStage(BRAKE_WAIT, getSequenceTimerMs(T_BRAKE), directionIndex == 2 ? "Auto UP: Brake hold" : "Auto DOWN: Brake hold");
+    setSequenceRunning(true);
   };
   for (;;) {
     controlHeartbeatMs = millis();
@@ -1081,7 +1189,7 @@ void controlTask(void *parameter) {
 
     // Relay activates only after the full delay while the physical button is held.
     if (readyDelayPending && buttonReading == LOW && buttonStableState == LOW &&
-        (uint32_t)(now - readyDelayStartMs) >= sequenceTimersMs[T_READY_DELAY]) {
+        (uint32_t)(now - readyDelayStartMs) >= getSequenceTimerMs(T_READY_DELAY)) {
       readyDelayPending = false;
       readyRelayOn = true;
       digitalWrite(PIN_READY_RELAY, HIGH); // active-HIGH relay ON
@@ -1096,53 +1204,53 @@ void controlTask(void *parameter) {
       } else if (buzzerRelayOn && (int32_t)(now - buzzerPulseEndMs) >= 0) {
         buzzerRelayOn = false;
         digitalWrite(PIN_BUZZER_RELAY, LOW);
-        buzzerNextPulseMs = now + sequenceTimersMs[T_BUZZER_INTERVAL];
+        buzzerNextPulseMs = now + getSequenceTimerMs(T_BUZZER_INTERVAL);
       }
     } else if (buzzerRelayOn) {
       buzzerRelayOn = false;
       digitalWrite(PIN_BUZZER_RELAY, LOW);
     }
 
-    if (sequenceRequest == 3) {
-      sequenceRequest = 0; stage = IDLE; sequenceRunning = false; runModeActive = false; sequenceStepDurationMs = 0; sequenceStepRemainingMs = 0; buzzerAfterRunMode = false; buzzerRelayOn = false; digitalWrite(PIN_BUZZER_RELAY, LOW);
+    const uint8_t request = takeSequenceRequest();
+    if (request == 3) {
+      stage = IDLE; setSequenceRunning(false); runModeActive = false; clearSequenceStep(); buzzerAfterRunMode = false; buzzerRelayOn = false; digitalWrite(PIN_BUZZER_RELAY, LOW);
       // Stop all motion outputs and speed selections; de-energize outputs to a safe software state.
-      for (size_t i = 0; i < OUTPUT_COUNT; ++i) setOutputState(i, false);
-      sequenceStatus = "Stopped — outputs OFF";
-    } else if ((sequenceRequest == 1 || sequenceRequest == 2 || sequenceRequest == 4) && stage == IDLE) {
-      const uint8_t request = sequenceRequest; sequenceRequest = 0;
+      applyOutputChanges((1UL << OUTPUT_COUNT) - 1UL, 0);
+      setSequenceStatus("Stopped — outputs OFF");
+    } else if ((request == 1 || request == 2 || request == 4) && stage == IDLE) {
       runModeActive = (request == 4);
       if (runModeActive) { buzzerAfterRunMode = false; buzzerRelayOn = false; digitalWrite(PIN_BUZZER_RELAY, LOW); }
-      runModeEndMs = runModeActive ? now + sequenceTimersMs[T_RUN_MODE] : 0;
+      runModeEndMs = runModeActive ? now + getSequenceTimerMs(T_RUN_MODE) : 0;
       beginCycle(request == 2 ? 3 : 2);
-      if (runModeActive) sequenceStatus = String("Run Mode: Auto UP (") + String(sequenceTimersMs[T_RUN_MODE] / 3600000UL) + " hour(s))";
+      if (runModeActive) setSequenceStatus(String("Run Mode: Auto UP (") + String(getSequenceTimerMs(T_RUN_MODE) / 3600000UL) + " hour(s))");
     }
     if (runModeActive && (int32_t)(now - runModeEndMs) >= 0) {
-      stage = IDLE; sequenceRunning = false; runModeActive = false; sequenceStepDurationMs = 0; sequenceStepRemainingMs = 0;
-      for (size_t i = 0; i < OUTPUT_COUNT; ++i) setOutputState(i, false);
-      sequenceStatus = "Run Mode complete — outputs OFF";
+      stage = IDLE; setSequenceRunning(false); runModeActive = false; clearSequenceStep();
+      applyOutputChanges((1UL << OUTPUT_COUNT) - 1UL, 0);
+      setSequenceStatus("Run Mode complete — outputs OFF");
       buzzerAfterRunMode = true; buzzerNextPulseMs = now;
     }
     if (stage != IDLE && (int32_t)(now - deadline) >= 0) {
       switch (stage) {
         case BRAKE_WAIT:
-          setOutputState(1, true); beginStage(ENABLE_WAIT, sequenceTimersMs[T_ENABLE], "Enable ON"); break;
+          setOutputState(1, true); beginStage(ENABLE_WAIT, getSequenceTimerMs(T_ENABLE), "Enable ON"); break;
         case ENABLE_WAIT:
-          setOutputState((size_t)directionIndex, true); beginStage(DIRECTION_WAIT, sequenceTimersMs[T_DIRECTION], directionIndex == 2 ? "Up ON" : "Down ON"); break;
+          setOutputState((size_t)directionIndex, true); beginStage(DIRECTION_WAIT, getSequenceTimerMs(T_DIRECTION), directionIndex == 2 ? "Up ON" : "Down ON"); break;
         case DIRECTION_WAIT:
-          setOnlySpeed(4); beginStage(SPEED0_A, sequenceTimersMs[T_SPEED0_A], "Speed 0 (first)"); break;
+          setOnlySpeed(4); beginStage(SPEED0_A, getSequenceTimerMs(T_SPEED0_A), "Speed 0 (first)"); break;
         case SPEED0_A:
-          setOnlySpeed(5); beginStage(SPEED1_A, sequenceTimersMs[T_SPEED1_A], "Speed 1 (first)"); break;
+          setOnlySpeed(5); beginStage(SPEED1_A, getSequenceTimerMs(T_SPEED1_A), "Speed 1 (first)"); break;
         case SPEED1_A:
-          setOnlySpeed(6); beginStage(SPEED2_HOLD, sequenceTimersMs[T_SPEED2], "Speed 2"); break;
+          setOnlySpeed(6); beginStage(SPEED2_HOLD, getSequenceTimerMs(T_SPEED2), "Speed 2"); break;
         case SPEED2_HOLD:
-          setOnlySpeed(5); beginStage(SPEED1_B, sequenceTimersMs[T_SPEED1_B], "Speed 1 (return)"); break;
+          setOnlySpeed(5); beginStage(SPEED1_B, getSequenceTimerMs(T_SPEED1_B), "Speed 1 (return)"); break;
         case SPEED1_B:
-          setOnlySpeed(4); beginStage(SPEED0_B, sequenceTimersMs[T_SPEED0_B], "Speed 0 (return)"); break;
+          setOnlySpeed(4); beginStage(SPEED0_B, getSequenceTimerMs(T_SPEED0_B), "Speed 0 (return)"); break;
         case SPEED0_B:
           allSpeedsOff(); setOutputState((size_t)directionIndex, false);
-          beginStage(DIRECTION_OFF_WAIT, sequenceTimersMs[T_DIRECTION_OFF], "Direction OFF delay"); break;
+          beginStage(DIRECTION_OFF_WAIT, getSequenceTimerMs(T_DIRECTION_OFF), "Direction OFF delay"); break;
         case DIRECTION_OFF_WAIT:
-          setOutputState(1, false); beginStage(ENABLE_OFF_WAIT, sequenceTimersMs[T_ENABLE_OFF], "Enable OFF delay"); break;
+          setOutputState(1, false); beginStage(ENABLE_OFF_WAIT, getSequenceTimerMs(T_ENABLE_OFF), "Enable OFF delay"); break;
         case ENABLE_OFF_WAIT:
           setOutputState(0, false);
           if (runModeActive && (int32_t)(millis() - runModeEndMs) < 0) {
@@ -1150,20 +1258,20 @@ void controlTask(void *parameter) {
             setOutputState(0, false);
             beginStage(RUNMODE_BRAKE_OFF_WAIT, 2000, "Run Mode: Brake OFF pause (2 s)");
           } else {
-            stage = IDLE; sequenceRunning = false;
-            if (runModeActive) { runModeActive = false; sequenceStatus = "Run Mode complete — outputs OFF"; buzzerAfterRunMode = true; buzzerNextPulseMs = millis(); }
-            else sequenceStatus = "Completed";
+            stage = IDLE; setSequenceRunning(false);
+            if (runModeActive) { runModeActive = false; setSequenceStatus("Run Mode complete — outputs OFF"); buzzerAfterRunMode = true; buzzerNextPulseMs = millis(); }
+            else setSequenceStatus("Completed");
           }
           break;
         case RUNMODE_BRAKE_OFF_WAIT:
           if (runModeActive && (int32_t)(millis() - runModeEndMs) < 0) {
             const int nextDirection = directionIndex == 2 ? 3 : 2;
             beginCycle(nextDirection);
-            sequenceStatus = nextDirection == 2 ? "Run Mode: Auto UP" : "Run Mode: Auto DOWN";
+            setSequenceStatus(nextDirection == 2 ? "Run Mode: Auto UP" : "Run Mode: Auto DOWN");
           } else {
-            stage = IDLE; sequenceRunning = false; runModeActive = false;
-            for (size_t i = 0; i < OUTPUT_COUNT; ++i) setOutputState(i, false);
-            sequenceStatus = "Run Mode complete — outputs OFF";
+            stage = IDLE; setSequenceRunning(false); runModeActive = false; clearSequenceStep();
+            applyOutputChanges((1UL << OUTPUT_COUNT) - 1UL, 0);
+            setSequenceStatus("Run Mode complete — outputs OFF");
             buzzerAfterRunMode = true; buzzerNextPulseMs = millis();
           }
           break;
@@ -1182,6 +1290,8 @@ void communicationTask(void *parameter) {
   size_t modbusLength = 0;
   size_t modbusExpectedLength = 0;
   uint32_t seenUartModeGeneration = uartModeGeneration;
+  bool canRecoveryPending = false;
+  uint32_t lastCanRecoveryAttemptMs = 0;
   twai_message_t message;
   for (;;) {
     // Batch UART bytes into bounded log records; one event per chunk avoids
@@ -1232,6 +1342,29 @@ void communicationTask(void *parameter) {
     if (twai_get_status_info(&twaiStatus) == ESP_OK) {
       canErrorCount = twaiStatus.bus_error_count + twaiStatus.tx_error_counter + twaiStatus.rx_error_counter;
       canBusState = (twaiStatus.state == TWAI_STATE_RUNNING) ? 1 : ((twaiStatus.state == TWAI_STATE_BUS_OFF) ? 2 : ((twaiStatus.state == TWAI_STATE_RECOVERING) ? 3 : 0));
+      const uint32_t statusNow = millis();
+      if (twaiStatus.state == TWAI_STATE_BUS_OFF && !canRecoveryPending &&
+          (uint32_t)(statusNow - lastCanRecoveryAttemptMs) >= 1000UL) {
+        lastCanRecoveryAttemptMs = statusNow;
+        const esp_err_t recovery = twai_initiate_recovery();
+        if (recovery == ESP_OK) {
+          canRecoveryPending = true;
+          addAnalyzerEvent("can", "Bus-off detected; TWAI recovery started");
+        } else {
+          addAnalyzerEvent("can", "TWAI recovery request failed; will retry");
+        }
+      } else if (twaiStatus.state == TWAI_STATE_STOPPED && canRecoveryPending &&
+                 (uint32_t)(statusNow - lastCanRecoveryAttemptMs) >= 1000UL) {
+        lastCanRecoveryAttemptMs = statusNow;
+        const esp_err_t restart = twai_start();
+        if (restart == ESP_OK) {
+          canRecoveryPending = false;
+          canDriverReady = true;
+          addAnalyzerEvent("can", "TWAI recovered and restarted");
+        } else {
+          addAnalyzerEvent("can", "TWAI restart after recovery failed; will retry");
+        }
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(2));
   }
@@ -1276,12 +1409,20 @@ void redirectToPortal() {
   server.send(302, "text/plain; charset=utf-8", "Opening I.R.A. dashboard...");
 }
 
+void failSafeHalt(const char *reason) {
+  for (size_t i = 0; i < OUTPUT_COUNT; ++i) digitalWrite(OUTPUTS[i].pin, LOW);
+  digitalWrite(PIN_READY_RELAY, LOW);
+  digitalWrite(PIN_BUZZER_RELAY, LOW);
+  digitalWrite(PIN_MODBUS_DE, LOW);
+  Serial.begin(115200);
+  Serial.print("FATAL INIT: ");
+  Serial.println(reason);
+  for (;;) delay(1000);
+}
+
 void setup() {
   // Safe software state from first initialization. For hazardous equipment,
   // external pull-downs / hardware interlocks are still required during reset.
-  stateMutex = xSemaphoreCreateMutex();
-  analyzerMutex = xSemaphoreCreateMutex();
-  uartMutex = xSemaphoreCreateMutex();
   pinMode(PIN_READY_BUTTON, INPUT_PULLUP);
   digitalWrite(PIN_MODBUS_DE, LOW);
   pinMode(PIN_MODBUS_DE, OUTPUT);
@@ -1291,6 +1432,15 @@ void setup() {
   for (size_t i = 0; i < OUTPUT_COUNT; ++i) {
     digitalWrite(OUTPUTS[i].pin, LOW);
     pinMode(OUTPUTS[i].pin, OUTPUT);
+  }
+
+  stateMutex = xSemaphoreCreateMutex();
+  controlStateMutex = xSemaphoreCreateMutex();
+  timerMutex = xSemaphoreCreateMutex();
+  analyzerMutex = xSemaphoreCreateMutex();
+  uartMutex = xSemaphoreCreateMutex();
+  if (!stateMutex || !controlStateMutex || !timerMutex || !analyzerMutex || !uartMutex) {
+    failSafeHalt("FreeRTOS mutex allocation failed");
   }
 
   prefs.begin("seq-timers", true);
@@ -1318,10 +1468,10 @@ void setup() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
   // Configure the AP address before starting the access point.
-  WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
-  WiFi.softAP(apSSID.c_str(), apPassword.c_str());
+  if (!WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET)) failSafeHalt("Access point IP configuration failed");
+  if (!WiFi.softAP(apSSID.c_str(), apPassword.c_str())) failSafeHalt("Access point start failed");
   // Resolve all hostnames to the ESP32 so captive-portal checks reach this server.
-  dnsServer.start(DNS_PORT, "*", AP_IP);
+  if (!dnsServer.start(DNS_PORT, "*", AP_IP)) failSafeHalt("Captive portal DNS start failed");
   if (staSSID.length()) WiFi.begin(staSSID.c_str(), staPassword.c_str());
 
   server.on("/", HTTP_GET, handleRoot);
@@ -1364,9 +1514,18 @@ void setup() {
 
   // Arduino loop and Wi-Fi system work use the framework's normal scheduling.
   // The explicit control, communications and status-LED tasks use FreeRTOS.
-  xTaskCreatePinnedToCore(controlTask, "control", 3072, nullptr, 3, &controlTaskHandle, 1);
-  xTaskCreatePinnedToCore(communicationTask, "comms", 4096, nullptr, 2, &communicationTaskHandle, 1);
-  xTaskCreatePinnedToCore(statusLedTask, "status-led", 2048, nullptr, 1, &statusLedTaskHandle, 1);
+  if (xTaskCreatePinnedToCore(controlTask, "control", 3072, nullptr, 3, &controlTaskHandle, 1) != pdPASS) {
+    failSafeHalt("Control task creation failed");
+  }
+  if (xTaskCreatePinnedToCore(communicationTask, "comms", 4096, nullptr, 2, &communicationTaskHandle, 1) != pdPASS) {
+    vTaskDelete(controlTaskHandle); controlTaskHandle = nullptr;
+    failSafeHalt("Communications task creation failed");
+  }
+  if (xTaskCreatePinnedToCore(statusLedTask, "status-led", 2048, nullptr, 1, &statusLedTaskHandle, 1) != pdPASS) {
+    vTaskDelete(communicationTaskHandle); communicationTaskHandle = nullptr;
+    vTaskDelete(controlTaskHandle); controlTaskHandle = nullptr;
+    failSafeHalt("Status LED task creation failed");
+  }
 }
 
 void loop() {
